@@ -1,0 +1,17 @@
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# PowerShell / editor artifacts
+*.log
+*.tmp
+*.bak
+*.swp
+.vscode/
+.idea/
+
+# Local release output
+release/
+*.zip
+*.7z
