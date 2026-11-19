@@ -1,10 +1,11 @@
 ﻿param(
     [string]$TargetPath = "",
     [switch]$DeepScanWorker,
-    [switch]$MapScanWorker
+    [switch]$MapScanWorker,
+    [string]$CandidatePids = ""
 )
 
-# GhostShredder v0.2.5
+# GhostShredder v0.3.0-alpha3
 # Standalone Windows force-delete utility. No realtime protection, no antivirus hooks.
 # Windows PowerShell 5.1+ / Windows 10-11 x64 recommended.
 
@@ -26,6 +27,7 @@ if (-not (Test-IsAdministrator)) {
     }
     if ($DeepScanWorker) { $arg += " -DeepScanWorker" }
     if ($MapScanWorker) { $arg += " -MapScanWorker" }
+    if ($CandidatePids) { $arg += " -CandidatePids `"$CandidatePids`"" }
     Start-Process -FilePath $ps -Verb RunAs -ArgumentList $arg
     exit
 }
@@ -425,7 +427,7 @@ public static class GhostNative
         finally { CloseHandle(dup); }
     }
 
-    public static HandleLock[] FindPathHandles(string target)
+    static HandleLock[] FindPathHandlesInternal(string target, HashSet<int> pidFilter)
     {
         EnableDebugPrivilege();
         LastHandleProcessesInaccessible = 0;
@@ -449,16 +451,19 @@ public static class GhostNative
                     int pid;
                     try { pid = unchecked((int)e.UniqueProcessId.ToUInt64()); } catch { continue; }
                     if (pid <= 0 || pid == self) continue;
+                    if (pidFilter != null && !pidFilter.Contains(pid)) continue;
+
                     IntPtr ph;
                     if (!procHandles.TryGetValue(pid, out ph)) {
                         ph = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
                         if (ph == IntPtr.Zero) LastHandleProcessesInaccessible++;
                         procHandles[pid] = ph;
                         string name = "pid" + pid;
-                        try { using (Process p = Process.GetProcessById(pid)) name = p.ProcessName; } catch {}
+                        try { using (Process proc = Process.GetProcessById(pid)) name = proc.ProcessName; } catch {}
                         procNames[pid] = name;
                     }
                     if (ph == IntPtr.Zero) continue;
+
                     string hp = null;
                     try { hp = GetHandlePath(ph, e.HandleValue.ToUInt64()); } catch {}
                     if (hp == null) { LastHandlePathResolutionFailures++; continue; }
@@ -473,6 +478,18 @@ public static class GhostNative
         }
         finally { Marshal.FreeHGlobal(table); }
         return found.ToArray();
+    }
+
+    public static HandleLock[] FindPathHandles(string target)
+    {
+        return FindPathHandlesInternal(target, null);
+    }
+
+    public static HandleLock[] FindPathHandlesForPids(string target, int[] pids)
+    {
+        if (pids == null || pids.Length == 0) return FindPathHandles(target);
+        HashSet<int> filter = new HashSet<int>(pids);
+        return FindPathHandlesInternal(target, filter);
     }
 
     static Dictionary<string,string> BuildDeviceMap()
@@ -616,12 +633,275 @@ try {
     exit 1
 }
 
+
+$restartManagerSource = @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Collections.Generic;
+
+public static class GhostRestartManager
+{
+    const int CCH_RM_SESSION_KEY = 32;
+    const int CCH_RM_MAX_APP_NAME = 255;
+    const int CCH_RM_MAX_SVC_NAME = 63;
+    const int ERROR_SUCCESS = 0;
+    const int ERROR_MORE_DATA = 234;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct FILETIME {
+        public uint dwLowDateTime;
+        public uint dwHighDateTime;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct RM_UNIQUE_PROCESS {
+        public int dwProcessId;
+        public FILETIME ProcessStartTime;
+    }
+
+    enum RM_APP_TYPE {
+        RmUnknownApp = 0,
+        RmMainWindow = 1,
+        RmOtherWindow = 2,
+        RmService = 3,
+        RmExplorer = 4,
+        RmConsole = 5,
+        RmCritical = 1000
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    struct RM_PROCESS_INFO {
+        public RM_UNIQUE_PROCESS Process;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst=CCH_RM_MAX_APP_NAME + 1)]
+        public string strAppName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst=CCH_RM_MAX_SVC_NAME + 1)]
+        public string strServiceShortName;
+        public RM_APP_TYPE ApplicationType;
+        public uint AppStatus;
+        public uint TSSessionId;
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool bRestartable;
+    }
+
+    public class LockingProcess {
+        public int Pid;
+        public string AppName;
+        public string ServiceName;
+        public override string ToString() {
+            string n = String.IsNullOrWhiteSpace(AppName) ? ("pid" + Pid) : AppName;
+            return n + " (PID " + Pid + ")";
+        }
+    }
+
+    [DllImport("rstrtmgr.dll", CharSet=CharSet.Unicode)]
+    static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, StringBuilder strSessionKey);
+
+    [DllImport("rstrtmgr.dll", CharSet=CharSet.Unicode)]
+    static extern int RmRegisterResources(
+        uint dwSessionHandle,
+        uint nFiles,
+        [MarshalAs(UnmanagedType.LPArray, ArraySubType=UnmanagedType.LPWStr)] string[] rgsFileNames,
+        uint nApplications,
+        IntPtr rgApplications,
+        uint nServices,
+        IntPtr rgsServiceNames);
+
+    [DllImport("rstrtmgr.dll")]
+    static extern int RmGetList(
+        uint dwSessionHandle,
+        out uint pnProcInfoNeeded,
+        ref uint pnProcInfo,
+        [In, Out] RM_PROCESS_INFO[] rgAffectedApps,
+        ref uint lpdwRebootReasons);
+
+    [DllImport("rstrtmgr.dll")]
+    static extern int RmEndSession(uint pSessionHandle);
+
+    public static int LastError = 0;
+
+    public static LockingProcess[] FindLockingProcesses(string fullFilePath)
+    {
+        LastError = 0;
+        if (String.IsNullOrWhiteSpace(fullFilePath)) return new LockingProcess[0];
+
+        uint handle;
+        StringBuilder key = new StringBuilder(CCH_RM_SESSION_KEY + 1);
+        int rc = RmStartSession(out handle, 0, key);
+        if (rc != ERROR_SUCCESS) {
+            LastError = rc;
+            return new LockingProcess[0];
+        }
+
+        try {
+            rc = RmRegisterResources(handle, 1, new string[] { fullFilePath }, 0, IntPtr.Zero, 0, IntPtr.Zero);
+            if (rc != ERROR_SUCCESS) {
+                LastError = rc;
+                return new LockingProcess[0];
+            }
+
+            uint needed = 0;
+            uint count = 0;
+            uint reasons = 0;
+            rc = RmGetList(handle, out needed, ref count, null, ref reasons);
+            if (rc == ERROR_SUCCESS && needed == 0) return new LockingProcess[0];
+            if (rc != ERROR_MORE_DATA) {
+                LastError = rc;
+                return new LockingProcess[0];
+            }
+
+            RM_PROCESS_INFO[] infos = new RM_PROCESS_INFO[needed];
+            count = needed;
+            rc = RmGetList(handle, out needed, ref count, infos, ref reasons);
+            if (rc != ERROR_SUCCESS) {
+                LastError = rc;
+                return new LockingProcess[0];
+            }
+
+            Dictionary<int,LockingProcess> unique = new Dictionary<int,LockingProcess>();
+            for (int i = 0; i < count; i++) {
+                int pid = infos[i].Process.dwProcessId;
+                if (pid <= 0) continue;
+                if (!unique.ContainsKey(pid)) {
+                    unique[pid] = new LockingProcess {
+                        Pid = pid,
+                        AppName = infos[i].strAppName,
+                        ServiceName = infos[i].strServiceShortName
+                    };
+                }
+            }
+            LockingProcess[] result = new LockingProcess[unique.Count];
+            unique.Values.CopyTo(result, 0);
+            return result;
+        }
+        finally {
+            RmEndSession(handle);
+        }
+    }
+}
+"@
+
+try {
+    Add-Type -TypeDefinition $restartManagerSource -Language CSharp -ErrorAction Stop
+    $script:RestartManagerCompileError = $null
+} catch {
+    $script:RestartManagerCompileError = $_.Exception.Message
+}
+
+$script:DropHelperCompileError = $null
+$script:NativeDropStatus = $null
+
+$dropSource = @"
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public sealed class GhostDropEventArgs : EventArgs
+{
+    public string[] Paths { get; private set; }
+    public GhostDropEventArgs(string[] paths) { Paths = paths ?? new string[0]; }
+}
+
+// WinForms AllowDrop uses OLE drag/drop, which Windows UIPI normally blocks when
+// Explorer runs at medium integrity and GhostShredder is elevated.  This helper
+// additionally enables the classic WM_DROPFILES path and explicitly allows the
+// required messages through the elevated window's message filter.
+public sealed class GhostElevatedDropTarget : NativeWindow, IDisposable
+{
+    const int WM_DROPFILES = 0x0233;
+    const uint WM_COPYGLOBALDATA = 0x0049;
+    const uint WM_COPYDATA = 0x004A;
+    const uint MSGFLT_ALLOW = 1;
+
+    [DllImport("shell32.dll")]
+    static extern void DragAcceptFiles(IntPtr hWnd, bool fAccept);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    static extern uint DragQueryFile(IntPtr hDrop, uint iFile, StringBuilder lpszFile, uint cch);
+
+    [DllImport("shell32.dll")]
+    static extern void DragFinish(IntPtr hDrop);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool ChangeWindowMessageFilterEx(IntPtr hWnd, uint message, uint action, IntPtr changeInfo);
+
+    public event EventHandler<GhostDropEventArgs> FilesDropped;
+    public bool DropMessageAllowed { get; private set; }
+    public bool CopyGlobalAllowed { get; private set; }
+    public bool CopyDataAllowed { get; private set; }
+
+    public GhostElevatedDropTarget(IntPtr hwnd)
+    {
+        AssignHandle(hwnd);
+        // WM_DROPFILES carries the HDROP; WM_COPYGLOBALDATA is required by the
+        // shell for cross-integrity global-memory transfer on UAC systems.
+        DropMessageAllowed = ChangeWindowMessageFilterEx(hwnd, (uint)WM_DROPFILES, MSGFLT_ALLOW, IntPtr.Zero);
+        CopyGlobalAllowed = ChangeWindowMessageFilterEx(hwnd, WM_COPYGLOBALDATA, MSGFLT_ALLOW, IntPtr.Zero);
+        CopyDataAllowed = ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, IntPtr.Zero);
+        DragAcceptFiles(hwnd, true);
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_DROPFILES)
+        {
+            IntPtr hDrop = m.WParam;
+            try
+            {
+                uint count = DragQueryFile(hDrop, 0xFFFFFFFF, null, 0);
+                List<string> paths = new List<string>((int)count);
+                for (uint i = 0; i < count; i++)
+                {
+                    uint len = DragQueryFile(hDrop, i, null, 0);
+                    StringBuilder sb = new StringBuilder((int)len + 1);
+                    if (DragQueryFile(hDrop, i, sb, (uint)sb.Capacity) > 0)
+                        paths.Add(sb.ToString());
+                }
+                EventHandler<GhostDropEventArgs> handler = FilesDropped;
+                if (handler != null && paths.Count > 0)
+                    handler(this, new GhostDropEventArgs(paths.ToArray()));
+            }
+            finally { DragFinish(hDrop); }
+            return;
+        }
+        base.WndProc(ref m);
+    }
+
+    public void Dispose()
+    {
+        try { if (Handle != IntPtr.Zero) DragAcceptFiles(Handle, false); } catch { }
+        try { ReleaseHandle(); } catch { }
+    }
+}
+"@
+
+try {
+    Add-Type -TypeDefinition $dropSource -Language CSharp -ReferencedAssemblies @('System.Windows.Forms.dll','System.dll') -ErrorAction Stop
+} catch {
+    # Do not abort the utility if the optional elevated drag/drop helper fails to
+    # compile.  File/folder buttons and manual path entry remain available.
+    $script:DropHelperCompileError = $_.Exception.Message
+}
+
 # Deep handle-name resolution is deliberately isolated in a child PowerShell.
 # Some filesystem/filter-driver handles can block path resolution indefinitely;
 # killing the worker must never freeze the GUI or the main shredding path.
 if ($DeepScanWorker) {
     try {
-        $items = @([GhostNative]::FindPathHandles($TargetPath))
+        $candidateArray = @()
+        if ($CandidatePids) {
+            foreach ($piece in ($CandidatePids -split ',')) {
+                $v = 0
+                if ([int]::TryParse($piece.Trim(), [ref]$v) -and $v -gt 0) { $candidateArray += $v }
+            }
+        }
+        $items = if ($candidateArray.Count -gt 0) {
+            @([GhostNative]::FindPathHandlesForPids($TargetPath, [int[]]$candidateArray))
+        } else {
+            @([GhostNative]::FindPathHandles($TargetPath))
+        }
         foreach ($x in $items) {
             $name = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$x.ProcessName))
             $path = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$x.Path))
@@ -796,92 +1076,133 @@ function Get-ExtendedPath([string]$Path) {
 }
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = 'GhostShredder v0.2.5 - 幽灵粉碎器'
-$form.Size = New-Object System.Drawing.Size(860, 620)
+$form.Text = 'GhostShredder v0.3.0-alpha3 - 幽灵粉碎器'
+$form.Size = New-Object System.Drawing.Size(1040, 760)
 $form.StartPosition = 'CenterScreen'
-$form.MinimumSize = New-Object System.Drawing.Size(760, 520)
-$form.AllowDrop = $true
+$form.MinimumSize = New-Object System.Drawing.Size(900, 650)
+$form.AllowDrop = $false
 
 $lbl = New-Object System.Windows.Forms.Label
-$lbl.Text = '目标文件 / 文件夹：'
-$lbl.Location = New-Object System.Drawing.Point(16, 18)
+$lbl.Text = '目标列表（支持同时添加文件 / 文件夹；可从资源管理器直接拖拽多个项目到列表）：'
+$lbl.Location = New-Object System.Drawing.Point(16, 16)
 $lbl.AutoSize = $true
 $form.Controls.Add($lbl)
 
-$pathBox = New-Object System.Windows.Forms.TextBox
-$pathBox.Location = New-Object System.Drawing.Point(16, 42)
-$pathBox.Size = New-Object System.Drawing.Size(595, 28)
-$pathBox.Anchor = 'Top,Left,Right'
-$pathBox.Text = $TargetPath
-$form.Controls.Add($pathBox)
+$targetList = New-Object System.Windows.Forms.ListView
+$targetList.Location = New-Object System.Drawing.Point(16, 40)
+$targetList.Size = New-Object System.Drawing.Size(988, 190)
+$targetList.Anchor = 'Top,Left,Right'
+$targetList.View = [System.Windows.Forms.View]::Details
+$targetList.FullRowSelect = $true
+$targetList.GridLines = $true
+$targetList.MultiSelect = $true
+$targetList.HideSelection = $false
+$targetList.AllowDrop = $false
+[void]$targetList.Columns.Add('类型', 90)
+[void]$targetList.Columns.Add('路径', 690)
+[void]$targetList.Columns.Add('状态', 190)
+$form.Controls.Add($targetList)
+
+$pathInput = New-Object System.Windows.Forms.TextBox
+$pathInput.Location = New-Object System.Drawing.Point(16, 238)
+$pathInput.Size = New-Object System.Drawing.Size(540, 28)
+$pathInput.Anchor = 'Top,Left,Right'
+$form.Controls.Add($pathInput)
+
+$addPath = New-Object System.Windows.Forms.Button
+$addPath.Text = '添加路径'
+$addPath.Location = New-Object System.Drawing.Point(566, 236)
+$addPath.Size = New-Object System.Drawing.Size(95, 32)
+$addPath.Anchor = 'Top,Right'
+$form.Controls.Add($addPath)
 
 $browseFile = New-Object System.Windows.Forms.Button
-$browseFile.Text = '选文件'
-$browseFile.Location = New-Object System.Drawing.Point(619, 40)
-$browseFile.Size = New-Object System.Drawing.Size(85, 30)
+$browseFile.Text = '添加文件'
+$browseFile.Location = New-Object System.Drawing.Point(671, 236)
+$browseFile.Size = New-Object System.Drawing.Size(105, 32)
 $browseFile.Anchor = 'Top,Right'
 $form.Controls.Add($browseFile)
 
 $browse = New-Object System.Windows.Forms.Button
-$browse.Text = '选文件夹'
-$browse.Location = New-Object System.Drawing.Point(714, 40)
-$browse.Size = New-Object System.Drawing.Size(110, 30)
+$browse.Text = '添加文件夹'
+$browse.Location = New-Object System.Drawing.Point(786, 236)
+$browse.Size = New-Object System.Drawing.Size(110, 32)
 $browse.Anchor = 'Top,Right'
 $form.Controls.Add($browse)
 
+$removeSelected = New-Object System.Windows.Forms.Button
+$removeSelected.Text = '移除选中'
+$removeSelected.Location = New-Object System.Drawing.Point(16, 276)
+$removeSelected.Size = New-Object System.Drawing.Size(105, 32)
+$form.Controls.Add($removeSelected)
+
+$clearTargets = New-Object System.Windows.Forms.Button
+$clearTargets.Text = '清空列表'
+$clearTargets.Location = New-Object System.Drawing.Point(131, 276)
+$clearTargets.Size = New-Object System.Drawing.Size(105, 32)
+$form.Controls.Add($clearTargets)
+
+$targetCount = New-Object System.Windows.Forms.Label
+$targetCount.Text = '目标：0 项'
+$targetCount.Location = New-Object System.Drawing.Point(250, 283)
+$targetCount.Size = New-Object System.Drawing.Size(754, 24)
+$targetCount.TextAlign = 'MiddleRight'
+$targetCount.Anchor = 'Top,Left,Right'
+$form.Controls.Add($targetCount)
+
 $analyze = New-Object System.Windows.Forms.Button
 $analyze.Text = '分析占用'
-$analyze.Location = New-Object System.Drawing.Point(16, 82)
-$analyze.Size = New-Object System.Drawing.Size(110, 36)
+$analyze.Location = New-Object System.Drawing.Point(16, 320)
+$analyze.Size = New-Object System.Drawing.Size(118, 36)
 $form.Controls.Add($analyze)
 
 $unlock = New-Object System.Windows.Forms.Button
 $unlock.Text = '解除占用'
-$unlock.Location = New-Object System.Drawing.Point(136, 82)
-$unlock.Size = New-Object System.Drawing.Size(110, 36)
+$unlock.Location = New-Object System.Drawing.Point(144, 320)
+$unlock.Size = New-Object System.Drawing.Size(118, 36)
 $form.Controls.Add($unlock)
 
 $delete = New-Object System.Windows.Forms.Button
 $delete.Text = '强制删除'
-$delete.Location = New-Object System.Drawing.Point(256, 82)
-$delete.Size = New-Object System.Drawing.Size(110, 36)
+$delete.Location = New-Object System.Drawing.Point(272, 320)
+$delete.Size = New-Object System.Drawing.Size(118, 36)
 $form.Controls.Add($delete)
 
 $ghost = New-Object System.Windows.Forms.Button
 $ghost.Text = '幽灵粉碎'
-$ghost.Location = New-Object System.Drawing.Point(376, 82)
-$ghost.Size = New-Object System.Drawing.Size(110, 36)
+$ghost.Location = New-Object System.Drawing.Point(400, 320)
+$ghost.Size = New-Object System.Drawing.Size(118, 36)
 $form.Controls.Add($ghost)
 
 $reboot = New-Object System.Windows.Forms.Button
 $reboot.Text = '下次启动删除'
-$reboot.Location = New-Object System.Drawing.Point(496, 82)
-$reboot.Size = New-Object System.Drawing.Size(125, 36)
+$reboot.Location = New-Object System.Drawing.Point(528, 320)
+$reboot.Size = New-Object System.Drawing.Size(132, 36)
 $form.Controls.Add($reboot)
 
 $clear = New-Object System.Windows.Forms.Button
 $clear.Text = '清日志'
-$clear.Location = New-Object System.Drawing.Point(631, 82)
-$clear.Size = New-Object System.Drawing.Size(75, 36)
+$clear.Location = New-Object System.Drawing.Point(670, 320)
+$clear.Size = New-Object System.Drawing.Size(92, 36)
 $form.Controls.Add($clear)
 
 $stop = New-Object System.Windows.Forms.Button
 $stop.Text = '停止当前任务'
-$stop.Location = New-Object System.Drawing.Point(716, 82)
-$stop.Size = New-Object System.Drawing.Size(108, 36)
+$stop.Location = New-Object System.Drawing.Point(772, 320)
+$stop.Size = New-Object System.Drawing.Size(132, 36)
 $stop.Enabled = $false
 $form.Controls.Add($stop)
 
 $warning = New-Object System.Windows.Forms.Label
-$warning.Text = '单任务模式：执行期间会锁定其他功能按钮，只保留“停止当前任务”。解除占用仍逐层检测、逐层授权。'
-$warning.Location = New-Object System.Drawing.Point(16, 128)
-$warning.Size = New-Object System.Drawing.Size(808, 40)
+$warning.Text = '批量模式：功能按钮默认处理列表中的全部目标，并按顺序逐项执行；不会并行关闭句柄或删除。执行期间列表与其他功能会锁定，只保留“停止当前任务”。'
+$warning.Location = New-Object System.Drawing.Point(16, 366)
+$warning.Size = New-Object System.Drawing.Size(988, 42)
 $warning.Anchor = 'Top,Left,Right'
 $form.Controls.Add($warning)
 
 $log = New-Object System.Windows.Forms.TextBox
-$log.Location = New-Object System.Drawing.Point(16, 168)
-$log.Size = New-Object System.Drawing.Size(808, 392)
+$log.Location = New-Object System.Drawing.Point(16, 412)
+$log.Size = New-Object System.Drawing.Size(988, 286)
 $log.Anchor = 'Top,Bottom,Left,Right'
 $log.Multiline = $true
 $log.ScrollBars = 'Both'
@@ -898,6 +1219,137 @@ function Write-Log([string]$Text) {
     [System.Windows.Forms.Application]::DoEvents()
 }
 
+
+# ---- multi-target queue helpers ----
+function Update-TargetCount {
+    $targetCount.Text = "目标：$($targetList.Items.Count) 项"
+}
+
+function Get-TargetKind([string]$Path) {
+    if ([System.IO.Directory]::Exists($Path)) { return '文件夹' }
+    if ([System.IO.File]::Exists($Path)) { return '文件' }
+    return '不存在'
+}
+
+function Find-TargetItem([string]$Path) {
+    $p = Get-NormalPath $Path
+    foreach ($item in $targetList.Items) {
+        if ([string]$item.Tag -ieq $p) { return $item }
+    }
+    return $null
+}
+
+function Add-TargetPath([string]$Path, [switch]$Quiet) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $p = Get-NormalPath ($Path.Trim().Trim('"'))
+    if (-not $p) { return $false }
+    if (Find-TargetItem $p) {
+        if (-not $Quiet) { Write-Log "目标已在列表中，已忽略重复项：$p" }
+        return $false
+    }
+
+    $kind = Get-TargetKind $p
+    $item = New-Object System.Windows.Forms.ListViewItem($kind)
+    [void]$item.SubItems.Add($p)
+    [void]$item.SubItems.Add('待处理')
+    $item.Tag = $p
+    [void]$targetList.Items.Add($item)
+    Update-TargetCount
+    return $true
+}
+
+function Add-TargetPaths([string[]]$Paths) {
+    $added = 0
+    foreach ($p in @($Paths)) {
+        if (Add-TargetPath $p -Quiet) { $added++ }
+    }
+    if ($added -gt 0) { Write-Log "已添加 $added 个目标；当前列表共 $($targetList.Items.Count) 项。" }
+    elseif (@($Paths).Count -gt 0) { Write-Log '拖入/选择的目标均已存在于列表中，未重复添加。' }
+}
+
+function Get-TargetPaths {
+    $result = New-Object System.Collections.Generic.List[string]
+    foreach ($item in $targetList.Items) { [void]$result.Add([string]$item.Tag) }
+    return $result.ToArray()
+}
+
+function Set-TargetStatus([string]$Path, [string]$Status) {
+    $item = Find-TargetItem $Path
+    if (-not $item) { return }
+    $item.SubItems[0].Text = Get-TargetKind ([string]$item.Tag)
+    $item.SubItems[2].Text = $Status
+    try {
+        $item.Selected = $true
+        $item.EnsureVisible()
+    } catch {}
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Reset-TargetSelection {
+    foreach ($item in $targetList.Items) { $item.Selected = $false }
+}
+
+function Get-TargetPreview([string[]]$Paths, [int]$MaxItems = 10) {
+    $items = @($Paths)
+    if ($items.Count -eq 0) { return '(无目标)' }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $n = [Math]::Min($items.Count, $MaxItems)
+    for ($i=0; $i -lt $n; $i++) { $lines.Add("  • $($items[$i])") }
+    if ($items.Count -gt $MaxItems) { $lines.Add("  • ……另有 $($items.Count - $MaxItems) 项") }
+    return ($lines -join "`r`n")
+}
+
+function Get-BatchTargetsOrLog {
+    $paths = @(Get-TargetPaths)
+    if ($paths.Count -eq 0) {
+        Write-Log '目标列表为空。请先添加或拖入文件/文件夹。'
+        return @()
+    }
+    return $paths
+}
+
+function Get-SafeMutationBatch([string[]]$Paths) {
+    $valid = New-Object System.Collections.Generic.List[string]
+    foreach ($raw in @($Paths)) {
+        $p = Assert-SafeTarget $raw -ForMutation
+        if (-not $p) { Set-TargetStatus $raw '已跳过（安全保护）'; continue }
+        if (-not (Test-TargetExists $p)) { Set-TargetStatus $raw '不存在 / 已消失'; continue }
+        [void]$valid.Add($p)
+    }
+    return $valid.ToArray()
+}
+
+function Invoke-TargetBatch([string]$OperationName, [string[]]$Paths, [scriptblock]$Action) {
+    $items = @($Paths)
+    $total = $items.Count
+    for ($i=0; $i -lt $total; $i++) {
+        Assert-NotCancelled
+        $p = $items[$i]
+        Reset-TargetSelection
+        Set-TargetStatus $p "$OperationName 中…"
+        Write-Log "========== [$($i+1)/$total] $OperationName：$p =========="
+        try {
+            $status = & $Action $p ($i+1) $total
+            if ([string]::IsNullOrWhiteSpace([string]$status)) { $status = '完成' }
+            Set-TargetStatus $p ([string]$status)
+        } catch [System.OperationCanceledException] {
+            Set-TargetStatus $p '已停止'
+            for ($j=$i+1; $j -lt $total; $j++) { Set-TargetStatus $items[$j] '未执行（批次已停止）' }
+            throw
+        } catch {
+            Set-TargetStatus $p '失败'
+            Write-Log "[$($i+1)/$total] $OperationName 失败：$($_.Exception.Message)"
+        }
+    }
+    Reset-TargetSelection
+}
+
+function Invoke-DropAdd([System.Windows.Forms.DragEventArgs]$EventArgs) {
+    if ($script:TaskRunning) { return }
+    $paths = $EventArgs.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)
+    if ($paths -and $paths.Length -gt 0) { Add-TargetPaths ([string[]]$paths) }
+}
+
 # ---- UI task / cancellation state ----
 $script:TaskRunning = $false
 $script:CancelRequested = $false
@@ -909,7 +1361,7 @@ function Set-TaskUiState([bool]$Busy, [string]$Name = '') {
     $script:TaskRunning = $Busy
     $script:ActiveTaskName = if ($Busy) { $Name } else { '' }
 
-    foreach ($ctl in @($analyze,$unlock,$delete,$ghost,$reboot,$browseFile,$browse,$clear,$pathBox)) {
+    foreach ($ctl in @($analyze,$unlock,$delete,$ghost,$reboot,$addPath,$browseFile,$browse,$removeSelected,$clearTargets,$clear,$targetList,$pathInput)) {
         try { $ctl.Enabled = -not $Busy } catch {}
     }
     $stop.Enabled = $Busy
@@ -973,7 +1425,7 @@ function Assert-NotCancelled {
     }
 }
 
-function Invoke-CancellableExternalProcess([string]$FilePath, [string]$Arguments, [switch]$Quiet) {
+function Invoke-CancellableExternalProcess([string]$FilePath, [string]$Arguments, [switch]$Quiet, [System.Text.Encoding]$OutputEncoding = $null) {
     Assert-NotCancelled
     $outFile = Join-Path $env:TEMP ("GhostShredder-exec-" + [Guid]::NewGuid().ToString('N') + '.out')
     $errFile = Join-Path $env:TEMP ("GhostShredder-exec-" + [Guid]::NewGuid().ToString('N') + '.err')
@@ -993,11 +1445,12 @@ function Invoke-CancellableExternalProcess([string]$FilePath, [string]$Arguments
         try { $exitCode = $proc.ExitCode } catch { $exitCode = $null }
         $lines = New-Object System.Collections.Generic.List[string]
         if (-not $Quiet) {
+            $enc = if ($OutputEncoding) { $OutputEncoding } else { [Text.Encoding]::UTF8 }
             if (Test-Path -LiteralPath $outFile) {
-                foreach ($line in [IO.File]::ReadAllLines($outFile)) { if ($line) { $lines.Add($line) } }
+                foreach ($line in [IO.File]::ReadAllLines($outFile, $enc)) { if ($line) { $lines.Add($line) } }
             }
             if (Test-Path -LiteralPath $errFile) {
-                foreach ($line in [IO.File]::ReadAllLines($errFile)) { if ($line) { $lines.Add($line) } }
+                foreach ($line in [IO.File]::ReadAllLines($errFile, $enc)) { if ($line) { $lines.Add($line) } }
             }
         }
         return [pscustomobject]@{ Cancelled=$false; ExitCode=$exitCode; Output=$lines.ToArray() }
@@ -1039,10 +1492,10 @@ function Invoke-DirectDelete([string]$Path) {
         $cmdExe = Join-Path $env:SystemRoot 'System32\cmd.exe'
         if ([System.IO.Directory]::Exists($p)) {
             Write-Log '尝试 rd /s /q（扩展路径）。'
-            $r = Invoke-CancellableExternalProcess $cmdExe ("/d /c rd /s /q `"$ext`"")
+            $r = Invoke-CancellableExternalProcess $cmdExe ("/u /d /c rd /s /q `"$ext`"") -OutputEncoding ([Text.Encoding]::Unicode)
         } else {
             Write-Log '尝试 del /f /q（扩展路径）。'
-            $r = Invoke-CancellableExternalProcess $cmdExe ("/d /c del /f /q `"$ext`"")
+            $r = Invoke-CancellableExternalProcess $cmdExe ("/u /d /c del /f /q `"$ext`"") -OutputEncoding ([Text.Encoding]::Unicode)
         }
         if ($r.Cancelled) { Assert-NotCancelled }
         foreach ($line in @($r.Output)) { if ($line) { Write-Log $line } }
@@ -1055,12 +1508,52 @@ function Invoke-DirectDelete([string]$Path) {
     return $false
 }
 
+function Get-RestartManagerCandidates([string]$Path) {
+    $p = Get-NormalPath $Path
+    if (-not $p) { return @{ Supported=$false; Status='INVALID'; Processes=@(); Error=0 } }
+    if ([System.IO.Directory]::Exists($p)) {
+        # Restart Manager's RmGetList returns ERROR_ACCESS_DENIED for directory resources.
+        return @{ Supported=$false; Status='DIRECTORY'; Processes=@(); Error=5 }
+    }
+    if (-not [System.IO.File]::Exists($p)) {
+        return @{ Supported=$false; Status='NOT_FILE'; Processes=@(); Error=0 }
+    }
+    if ($script:RestartManagerCompileError) {
+        return @{ Supported=$false; Status='COMPILE_ERROR'; Processes=@(); Error=0 }
+    }
+    try {
+        $items = @([GhostRestartManager]::FindLockingProcesses($p))
+        $err = [GhostRestartManager]::LastError
+        if ($err -ne 0) {
+            return @{ Supported=$true; Status='ERROR'; Processes=@(); Error=$err }
+        }
+        return @{ Supported=$true; Status='OK'; Processes=$items; Error=0 }
+    } catch {
+        return @{ Supported=$true; Status='ERROR'; Processes=@(); Error=-1; Message=$_.Exception.Message }
+    }
+}
+
 function Invoke-SafeHandleScan([string]$Path, [int]$TimeoutSeconds = 8) {
     $p = Get-NormalPath $Path
     $outFile = Join-Path $env:TEMP ("GhostShredder-deepscan-" + [Guid]::NewGuid().ToString('N') + '.out')
     $errFile = Join-Path $env:TEMP ("GhostShredder-deepscan-" + [Guid]::NewGuid().ToString('N') + '.err')
     $ps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $rm = Get-RestartManagerCandidates $p
+    $candidateCsv = ""
+    if ($rm.Status -eq 'OK' -and @($rm.Processes).Count -gt 0) {
+        $candidateCsv = (@($rm.Processes | ForEach-Object { [string]$_.Pid }) -join ',')
+        $desc = (@($rm.Processes | ForEach-Object { "$($_.AppName) (PID $($_.Pid))" }) -join '; ')
+        Write-Log "B/RM 快速定位：本次发现 $(@($rm.Processes).Count) 个正在使用该文件的进程：$desc"
+    } elseif ($rm.Status -eq 'OK') {
+        Write-Log 'B/RM 快速定位：本次暂未发现 Restart Manager 可见的文件使用进程；继续使用全局句柄扫描兜底。'
+    } elseif ($rm.Status -eq 'DIRECTORY') {
+        Write-Log 'B/RM 快速定位：目标是目录，Restart Manager 不接受目录资源；使用全局句柄扫描。'
+    } elseif ($rm.Status -eq 'ERROR') {
+        Write-Log "B/RM 快速定位未形成结论（Win32 error=$($rm.Error)）；继续使用全局句柄扫描。"
+    }
+
     $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DeepScanWorker -TargetPath `"$p`""
+    if ($candidateCsv) { $arg += " -CandidatePids `"$candidateCsv`"" }
     $proc = $null
     try {
         $proc = Start-Process -FilePath $ps -ArgumentList $arg -WindowStyle Hidden -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
@@ -1071,14 +1564,14 @@ function Invoke-SafeHandleScan([string]$Path, [int]$TimeoutSeconds = 8) {
             [System.Windows.Forms.Application]::DoEvents()
             if (Test-CancelRequested) {
                 Stop-ActiveWorkerProcess
-                return @{ Cancelled=$true; TimedOut=$false; Locks=@(); Inaccessible=0; PathFailures=0 }
+                return @{ Cancelled=$true; TimedOut=$false; Locks=@(); Inaccessible=0; PathFailures=0; RestartManager=$rm; Targeted=([bool]$candidateCsv) }
             }
             try { $proc.Refresh() } catch {}
         }
         if (-not $proc.HasExited) {
             Write-Log "普通句柄扫描超过 ${TimeoutSeconds}s，已终止隔离扫描进程；本次该类别扫描未完成，主界面不会被拖死。"
             try { & "$env:SystemRoot\System32\taskkill.exe" /PID $proc.Id /T /F 2>$null | Out-Null } catch { try { $proc.Kill() } catch {} }
-            return @{ Cancelled=$false; TimedOut=$true; Locks=@(); Inaccessible=0; PathFailures=0 }
+            return @{ Cancelled=$false; TimedOut=$true; Locks=@(); Inaccessible=0; PathFailures=0; RestartManager=$rm; Targeted=([bool]$candidateCsv) }
         }
 
         $locks = @()
@@ -1110,10 +1603,10 @@ function Invoke-SafeHandleScan([string]$Path, [int]$TimeoutSeconds = 8) {
             $errs = ([IO.File]::ReadAllText($errFile)).Trim()
             if ($errs) { Write-Log "深度扫描诊断：$errs" }
         }
-        return @{ Cancelled=$false; TimedOut=$false; Locks=$locks; Inaccessible=$inaccessible; PathFailures=$pathFailures }
+        return @{ Cancelled=$false; TimedOut=$false; Locks=$locks; Inaccessible=$inaccessible; PathFailures=$pathFailures; RestartManager=$rm; Targeted=([bool]$candidateCsv) }
     } catch {
         Write-Log "启动隔离深度扫描失败：$($_.Exception.Message)"
-        return @{ Cancelled=$false; TimedOut=$false; Locks=@(); Inaccessible=0; PathFailures=0 }
+        return @{ Cancelled=$false; TimedOut=$false; Locks=@(); Inaccessible=0; PathFailures=0; RestartManager=$rm; Targeted=([bool]$candidateCsv) }
     } finally {
         if ($script:ActiveWorkerProcess -eq $proc) { $script:ActiveWorkerProcess = $null }
         if ($proc) { try { $proc.Dispose() } catch {} }
@@ -1710,119 +2203,201 @@ $(Format-HandlePreview $newLocks)
     Write-Log '========== 完成 =========='
 }
 
+$addPath.Add_Click({
+    if ($script:TaskRunning) { return }
+    $raw = $pathInput.Text
+    if ([string]::IsNullOrWhiteSpace($raw)) { return }
+    Add-TargetPaths @($raw)
+    $pathInput.Clear()
+})
+
+$pathInput.Add_KeyDown({
+    if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Enter -and -not $script:TaskRunning) {
+        $_.SuppressKeyPress = $true
+        $raw = $pathInput.Text
+        if (-not [string]::IsNullOrWhiteSpace($raw)) {
+            Add-TargetPaths @($raw)
+            $pathInput.Clear()
+        }
+    }
+})
+
 $browseFile.Add_Click({
     $dlg = New-Object System.Windows.Forms.OpenFileDialog
-    $dlg.Title = '选择要分析/解除/删除的文件'
+    $dlg.Title = '选择要添加到 GhostShredder 的文件（可多选）'
     $dlg.CheckFileExists = $true
-    if ($dlg.ShowDialog() -eq 'OK') { $pathBox.Text = $dlg.FileName }
+    $dlg.Multiselect = $true
+    if ($dlg.ShowDialog() -eq 'OK') { Add-TargetPaths ([string[]]$dlg.FileNames) }
 })
 
 $browse.Add_Click({
     $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dlg.Description = '选择要强制删除的文件夹'
-    if ($dlg.ShowDialog() -eq 'OK') { $pathBox.Text = $dlg.SelectedPath }
+    $dlg.Description = '选择要添加到 GhostShredder 的文件夹；多个文件夹可重复添加，或直接从资源管理器批量拖入。'
+    if ($dlg.ShowDialog() -eq 'OK') { Add-TargetPaths @($dlg.SelectedPath) }
+})
+
+$removeSelected.Add_Click({
+    if ($script:TaskRunning) { return }
+    $selected = @($targetList.SelectedItems)
+    if ($selected.Count -eq 0) { return }
+    foreach ($item in $selected) { $targetList.Items.Remove($item) }
+    Update-TargetCount
+    Write-Log "已从列表移除 $($selected.Count) 个目标（未删除磁盘内容）。"
+})
+
+$clearTargets.Add_Click({
+    if ($script:TaskRunning) { return }
+    if ($targetList.Items.Count -eq 0) { return }
+    $count = $targetList.Items.Count
+    $targetList.Items.Clear()
+    Update-TargetCount
+    Write-Log "已清空目标列表，共移除 $count 项（未删除磁盘内容）。"
 })
 
 $analyze.Add_Click({
-    Invoke-UiTask '分析占用' {
-        $p = Get-NormalPath $pathBox.Text
-        if (-not $p -or -not (Test-TargetExists $p)) { Write-Log '目标不存在。'; return }
-        Invoke-Analyze $p | Out-Null
+    $targets = @(Get-BatchTargetsOrLog)
+    if ($targets.Count -eq 0) { return }
+    Invoke-UiTask "批量分析占用（$($targets.Count) 项）" {
+        Invoke-TargetBatch '分析占用' $targets {
+            param($p,$index,$total)
+            if (-not (Test-TargetExists $p)) { Write-Log '目标不存在或已经消失。'; return '不存在 / 已消失' }
+            Invoke-Analyze $p | Out-Null
+            return '分析完成'
+        }
     }
 })
 
 $unlock.Add_Click({
-    Invoke-UiTask '解除占用' {
-        $p = Assert-SafeTarget $pathBox.Text -ForMutation
-        if (-not $p) { return }
-        if (-not (Test-TargetExists $p)) { Write-Log '目标不存在。'; return }
-        Invoke-UnlockOnly $p
+    $targets = @(Get-BatchTargetsOrLog)
+    if ($targets.Count -eq 0) { return }
+    Invoke-UiTask "批量解除占用（$($targets.Count) 项）" {
+        $safe = @(Get-SafeMutationBatch $targets)
+        if ($safe.Count -eq 0) { Write-Log '没有可执行解除占用的目标。'; return }
+        Invoke-TargetBatch '解除占用' $safe {
+            param($p,$index,$total)
+            if (-not (Test-TargetExists $p)) { return '不存在 / 已消失' }
+            Invoke-UnlockOnly $p
+            return '处理完成'
+        }
     }
 })
 
 $delete.Add_Click({
-    Invoke-UiTask '强制删除' {
-        $p = Assert-SafeTarget $pathBox.Text -ForMutation
-        if (-not $p) { return }
-        if (-not (Test-TargetExists $p)) { Write-Log '目标不存在。'; return }
-        $kind = if ([System.IO.Directory]::Exists($p)) { '文件夹' } else { '文件' }
+    $targets = @(Get-BatchTargetsOrLog)
+    if ($targets.Count -eq 0) { return }
+    Invoke-UiTask "批量强制删除（$($targets.Count) 项）" {
+        $safe = @(Get-SafeMutationBatch $targets)
+        if ($safe.Count -eq 0) { Write-Log '没有可执行强制删除的目标。'; return }
         $msg = @"
-确定永久删除以下$kind？
+确定永久删除以下 $($safe.Count) 个目标？
 
-$p
+$(Get-TargetPreview $safe)
 
-“强制删除”不会主动关闭其他进程句柄；如果目标仍被占用，删除可能失败。
+“强制删除”不会主动关闭其他进程句柄；若目标仍被占用，对应项目可能删除失败，其余目标仍会继续处理。
 
+批量任务按列表顺序逐项执行，不并行删除。
 此操作不经过回收站，无法撤销。
 "@
-        if (Show-Confirm $msg 'GhostShredder - 强制删除' ([System.Windows.Forms.MessageBoxIcon]::Warning)) {
-            Assert-NotCancelled
-            Invoke-DirectDelete $p | Out-Null
-        } else { Write-Log '已取消“强制删除”。' }
+        if (-not (Show-Confirm $msg 'GhostShredder - 批量强制删除' ([System.Windows.Forms.MessageBoxIcon]::Warning))) {
+            Write-Log '已取消“批量强制删除”。'
+            return
+        }
+        Invoke-TargetBatch '强制删除' $safe {
+            param($p,$index,$total)
+            if (-not (Test-TargetExists $p)) { return '不存在 / 已消失' }
+            if (Invoke-DirectDelete $p) { return '已删除' }
+            return '删除失败'
+        }
     }
 })
 
 $ghost.Add_Click({
-    Invoke-UiTask '幽灵粉碎' {
-        $p = Assert-SafeTarget $pathBox.Text -ForMutation
-        if (-not $p) { return }
-        if (-not (Test-TargetExists $p)) { Write-Log '目标不存在。'; return }
-        Assert-NotCancelled
-        $cwdPreview = @(Get-QuickCwdPreview $p)
-        $previewText = Format-CwdPreview $cwdPreview
-        $snapshotText = Get-AnalysisSnapshotText $p
-        if (-not $snapshotText) { $snapshotText = '最近一次完整分析：无可复用快照；除 CWD 外的类别尚未进行本次完整扫描。' }
-        $msg = @"
+    $targets = @(Get-BatchTargetsOrLog)
+    if ($targets.Count -eq 0) { return }
+    Invoke-UiTask "批量幽灵粉碎（$($targets.Count) 项）" {
+        $safe = @(Get-SafeMutationBatch $targets)
+        if ($safe.Count -eq 0) { Write-Log '没有可执行幽灵粉碎的目标。'; return }
+
+        if ($safe.Count -eq 1) {
+            $p0 = $safe[0]
+            $cwdPreview = @(Get-QuickCwdPreview $p0)
+            $previewText = Format-CwdPreview $cwdPreview
+            $snapshotText = Get-AnalysisSnapshotText $p0
+            if (-not $snapshotText) { $snapshotText = '最近一次完整分析：无可复用快照；除 CWD 外的类别尚未进行本次完整扫描。' }
+            $msg = @"
 确定执行“幽灵粉碎”？
 
 目标：
-$p
+$p0
 
 $previewText
 
 $snapshotText
 
-说明：确认框不会为了“完整扫描”强制等待；若此前刚执行过“分析占用”且其后本工具未修改目标状态，这里会复用并标注那次快照。任何成功的句柄关闭都会使旧快照立即失效。
-
-执行流程：
-1. 先尝试永久删除目标；
-2. 若失败，解除当前可处理的占用后立即重试删除；
-3. 若仍失败，最多再进行 3 轮“重新检测占用 → 解除 → 立即删除”；
-4. 3 轮后仍失败，才诊断 Mapping / SMB / Filter 等其他类别。
+执行流程：先尝试永久删除；失败后解除当前可处理占用并立即重删；若仍失败，最多再追杀 3 轮。新的普通文件/目录句柄仍会按渐进授权规则单独确认。
 
 不会主动结束整个进程，但被关闭句柄的程序可能出现相对路径或文件访问异常。
-
 此操作不经过回收站，无法撤销。
 "@
-        if (Show-Confirm $msg 'GhostShredder - 幽灵粉碎（高风险）' ([System.Windows.Forms.MessageBoxIcon]::Stop)) {
-            Assert-NotCancelled
+        } else {
+            $msg = @"
+确定对列表中的 $($safe.Count) 个目标执行“幽灵粉碎”？
+
+$(Get-TargetPreview $safe)
+
+本次确认授权 GhostShredder 对以上目标逐项执行删除优先流程，并在需要时关闭命中的 CWD 句柄。若后续扫描发现新的普通文件/目录句柄，仍会列出进程 / PID / 路径并按渐进授权规则请求确认。
+
+批量任务严格按列表顺序执行，不并行关闭句柄或删除；单个目标失败不会自动跳过剩余目标，除非用户停止整个批次。
+
+被关闭句柄的程序可能继续存活，但后续相对路径或文件访问可能异常。
+此操作不经过回收站，无法撤销。
+"@
+        }
+
+        if (-not (Show-Confirm $msg 'GhostShredder - 批量幽灵粉碎（高风险）' ([System.Windows.Forms.MessageBoxIcon]::Stop))) {
+            Write-Log '已取消“批量幽灵粉碎”。'
+            return
+        }
+
+        Invoke-TargetBatch '幽灵粉碎' $safe {
+            param($p,$index,$total)
+            if (-not (Test-TargetExists $p)) { return '不存在 / 已消失' }
             Invoke-GhostShred $p
-        } else { Write-Log '已取消“幽灵粉碎”。' }
+            if (Test-TargetExists $p) { return '仍存在' }
+            return '已粉碎'
+        }
     }
 })
 
 $reboot.Add_Click({
-    Invoke-UiTask '下次启动删除' {
-        $p = Assert-SafeTarget $pathBox.Text -ForMutation
-        if (-not $p) { return }
-        if (-not (Test-TargetExists $p)) { Write-Log '目标不存在。'; return }
+    $targets = @(Get-BatchTargetsOrLog)
+    if ($targets.Count -eq 0) { return }
+    Invoke-UiTask "批量下次启动删除（$($targets.Count) 项）" {
+        $safe = @(Get-SafeMutationBatch $targets)
+        if ($safe.Count -eq 0) { Write-Log '没有可登记下次启动删除的目标。'; return }
         $msg = @"
-确定登记“下次启动删除”？
+确定登记以下 $($safe.Count) 个目标在下次 Windows 启动时删除？
 
-目标：
-$p
+$(Get-TargetPreview $safe)
 
-目标不会现在删除，而会登记给 Windows，在未来某次系统启动阶段尝试删除。
-
-注意：如果你很久以后才重启，删除动作仍会在那次启动时发生。请确认你不会在此期间忘记这项登记或重新把该路径当作有效数据使用。
-
+目标不会现在删除。即使很久以后才重启，登记仍会在那次启动阶段生效。
 继续？
 "@
-        if (Show-Confirm $msg 'GhostShredder - 下次启动删除' ([System.Windows.Forms.MessageBoxIcon]::Warning)) {
+        if (-not (Show-Confirm $msg 'GhostShredder - 批量下次启动删除' ([System.Windows.Forms.MessageBoxIcon]::Warning))) {
+            Write-Log '已取消“批量下次启动删除”。'
+            return
+        }
+        Invoke-TargetBatch '登记启动删除' $safe {
+            param($p,$index,$total)
+            if (-not (Test-TargetExists $p)) { return '不存在 / 已消失' }
             Assert-NotCancelled
-            if ([GhostNative]::ScheduleDeleteOnReboot($p)) { Write-Log '已登记：下次 Windows 启动时删除。' }
-            else { Write-Log "登记失败，Win32 error=$([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
-        } else { Write-Log '已取消“下次启动删除”。' }
+            if ([GhostNative]::ScheduleDeleteOnReboot($p)) {
+                Write-Log '已登记：下次 Windows 启动时删除。'
+                return '已登记'
+            }
+            Write-Log "登记失败，Win32 error=$([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+            return '登记失败'
+        }
     }
 })
 
@@ -1853,18 +2428,49 @@ $form.Add_FormClosing({
     }
 })
 
-$form.Add_DragEnter({
-    if (-not $script:TaskRunning -and $_.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { $_.Effect = 'Copy' } else { $_.Effect = 'None' }
-})
-$form.Add_DragDrop({
-    if ($script:TaskRunning) { return }
-    $files = $_.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)
-    if ($files -and $files.Length -gt 0) { $pathBox.Text = $files[0] }
+$form.Add_FormClosed({
+    foreach ($dropTarget in @($script:NativeDropTargets)) {
+        try { $dropTarget.Dispose() } catch {}
+    }
+    $script:NativeDropTargets = @()
 })
 
-Write-Log 'GhostShredder v0.2.5 已启动（管理员权限）。'
+# GhostShredder runs elevated.  Do NOT register WinForms/OLE AllowDrop on the
+# elevated form: Explorer normally runs at medium integrity and its OLE drop is
+# blocked by UIPI before our managed DragDrop handler can run.  Instead use only
+# the classic WM_DROPFILES path below, with WM_COPYGLOBALDATA explicitly allowed.
+# This avoids the elevated OLE target competing with the legacy shell drop path.
+$script:NativeDropTargets = @()
+if (-not $script:DropHelperCompileError) {
+    try {
+        # Force handle creation before attaching NativeWindow hooks.  Register both
+        # the ListView and the parent Form because the child under the mouse receives
+        # WM_DROPFILES.
+        [void]$form.Handle
+        [void]$targetList.Handle
+        $formDrop = New-Object GhostElevatedDropTarget($form.Handle)
+        $listDrop = New-Object GhostElevatedDropTarget($targetList.Handle)
+        $nativeDropHandler = {
+            param($sender, $e)
+            if (-not $script:TaskRunning -and $e -and $e.Paths) { Add-TargetPaths ([string[]]$e.Paths) }
+        }
+        $formDrop.add_FilesDropped($nativeDropHandler)
+        $listDrop.add_FilesDropped($nativeDropHandler)
+        $script:NativeDropTargets = @($formDrop, $listDrop)
+        $script:NativeDropStatus = "form:drop=$($formDrop.DropMessageAllowed),copyglobal=$($formDrop.CopyGlobalAllowed); list:drop=$($listDrop.DropMessageAllowed),copyglobal=$($listDrop.CopyGlobalAllowed)"
+    } catch {
+        $script:DropHelperCompileError = $_.Exception.Message
+    }
+}
+
+if ($TargetPath) { Add-TargetPaths @($TargetPath) }
+
+Write-Log 'GhostShredder v0.3.0-alpha3 已启动（管理员权限）。'
 Write-Log '占用模型：CWD / FileHandle / MemoryMapping / SMB / Filter 分类别报告；未发现某一类不等于没有其他占用。解除占用采用逐层检测、逐层授权；幽灵粉碎采用删除优先的追杀循环。'
-Write-Log '任务控制：单任务运行；执行期间其他功能按钮自动锁定。“停止当前任务”会立即终止活动的隔离扫描/外部子进程，并在当前不可中断调用返回后退出主流程。'
+Write-Log '批量目标：支持多文件/多文件夹列表、手动路径添加与资源管理器拖拽；管理员窗口额外启用 WM_DROPFILES/UIPI 消息白名单通道；所有功能默认按列表顺序逐项处理，不并行执行。'
+if ($script:NativeDropStatus) { Write-Log ("拖拽通道：" + $script:NativeDropStatus) } elseif ($script:DropHelperCompileError) { Write-Log ("拖拽辅助初始化失败：" + $script:DropHelperCompileError) }
+if ($script:DropHelperCompileError) { Write-Log "拖拽兼容层未启用：$($script:DropHelperCompileError)；仍可使用添加文件/文件夹按钮。" }
+Write-Log '任务控制：单批次运行；执行期间目标列表与其他功能按钮自动锁定。“停止当前任务”会终止活动的隔离扫描/外部子进程，并在当前不可中断调用返回后退出整个批次。'
 if ([IntPtr]::Size -ne 8) { Write-Log '警告：当前是 32 位 PowerShell。建议使用 64 位 Windows PowerShell。' }
 
 [void]$form.ShowDialog()

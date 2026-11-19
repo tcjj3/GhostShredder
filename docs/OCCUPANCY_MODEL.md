@@ -10,17 +10,26 @@ GhostShredder 不把 Windows 上所有“无法删除”都视为同一种锁。
 
 GhostShredder 通过读取进程 PEB 中的 CurrentDirectory 信息定位这类占用，并可在用户确认后关闭对应远程句柄。
 
-### 注意
-
-关闭 CWD handle 并不等于让目标进程自动切换到新的工作目录。进程可能继续存活，但相对路径操作随后出现句柄无效等异常。
+关闭 CWD handle 并不等于让目标进程自动切换工作目录。进程可能继续存活，但相对路径操作随后出现句柄无效等异常。
 
 ## B — File / Directory Handle
 
 普通文件或目录可以由 `CreateFile` 等 API 打开。如果打开方没有共享 `FILE_SHARE_DELETE`，后续删除/重命名可能产生 sharing violation。
 
-GhostShredder 在隔离子进程中枚举系统 Handle 并做路径匹配；发现精确命中后，经用户确认可关闭远程句柄。
+### 文件目标：Restart Manager 快速定位
 
-全局 Handle 名称解析在部分系统/过滤驱动环境中可能非常慢，因此扫描有超时边界。超时只表示“本次扫描未完成”。
+从 v0.3.0-alpha3 起，文件目标先调用 Windows Restart Manager：
+
+1. 注册具体文件路径；
+2. 获取当前使用该资源的候选进程；
+3. 若得到候选 PID，仅枚举这些 PID 的 File Handle 并做精确路径匹配；
+4. 若没有得到候选，再退回原来的全局 Handle 扫描。
+
+Restart Manager 只是**候选进程缩小器**，不是最终“占用判决器”。RM 暂未发现候选不能被解释成“文件没有占用”。
+
+目录目标不使用这一快车道，继续依赖 CWD + Handle 路径。
+
+全局 Handle 名称解析在部分系统/过滤驱动环境中可能非常慢，因此扫描有超时边界；超时只表示“本次扫描未完成”。
 
 ## C — Memory Mapping / IMAGE
 
@@ -28,40 +37,27 @@ GhostShredder 在隔离子进程中枚举系统 Handle 并做路径匹配；发�
 
 GhostShredder 使用 `VirtualQueryEx` + `GetMappedFileName` 诊断 `MEM_MAPPED` / `MEM_IMAGE` 区域。
 
-当前版本**不会**通过远程线程、代码注入等方式强制 `UnmapViewOfFile`，因此该类别只诊断。
+当前版本不会通过远程线程、代码注入等方式强制 `UnmapViewOfFile`，因此该类别只诊断。
 
 ## D — SMB Server Open
 
-当本机作为 SMB Server 时，远程客户端可能保持目标文件打开。此时本机普通进程 Handle 扫描并不能完整表达远端会话状态。
-
-当前版本查询 SMB Server open items，但不主动断开远端会话。
+当本机作为 SMB Server 时，远程客户端可能保持目标文件打开。当前版本查询 SMB Server open items，但不主动断开远端会话。
 
 ## E — Filter / Minifilter
 
 杀毒、备份、同步、加密、DLP 等软件可能以文件系统 Filter/Minifilter 形式工作。
 
-GhostShredder 只把目标卷上挂载的 Filter 当作**诊断上下文**：
-
-- 挂载 ≠ 正在占用目标；
-- 没有额外 ETW/内核调试/驱动证据时，不应把某个 Filter 直接归因为阻塞者。
+目标卷上的 Filter 只作为诊断上下文：挂载不等于正在占用目标，不能在没有额外证据时直接归因为阻塞者。
 
 ## F — DELETE-access probe
 
-这是一个只读性质的能力探针：测试是否能够对目标取得 DELETE access，不执行删除。
-
-它可以帮助区分 sharing violation、access denied 等失败类型，但不是完整占用扫描器。
+只测试是否能够对目标取得 DELETE access，不执行删除。它可以帮助区分 sharing violation、access denied 等失败类型，但不是完整占用扫描器。
 
 ## G — Non-occupancy diagnostics
 
-一些“删不掉”根本不是占用，例如：
+一些“删不掉”根本不是占用，例如 ACL/owner、readonly/system/hidden 属性、reparse point、路径与文件系统特殊状态或文件系统损坏。
 
-- ACL / owner；
-- readonly / system / hidden 属性；
-- reparse point；
-- 路径与文件系统特殊状态；
-- 文件系统损坏或驱动私有状态。
-
-因此 GhostShredder 始终区分：
+因此始终区分：
 
 ```text
 Occupancy / Lock  !=  Deletion Failure
@@ -69,7 +65,7 @@ Occupancy / Lock  !=  Deletion Failure
 
 ## 三态观测语义
 
-每个扫描类别只能产生以下语义之一：
+每个扫描类别只能产生：
 
 1. **发现 N 个** — 本次有正向证据；
 2. **本次暂未发现** — 扫描完成且本次未命中，仅代表当前观测；
@@ -85,10 +81,8 @@ Occupancy / Lock  !=  Deletion Failure
 
 ### 幽灵粉碎
 
-以“目标删除成功”为终止条件：
+以“目标删除成功”为终止条件：先尝试删除；失败才解除已知占用；占用一解除立即重删；仍失败才继续下一轮；最多有限轮次追杀。
 
-1. 先尝试删除；
-2. 失败才解除已知占用；
-3. 占用一解除立即重删；
-4. 仍失败才继续下一轮检测/解除；
-5. 最多进行有限轮次追杀，避免无限循环。
+## 多目标调度不是新占用类型
+
+v0.3 的目标队列属于调度层，而不是占用模型的一部分。每个目标仍独立运行 A–G 分类；批次只负责按列表顺序串行调用，避免多个目标同时修改同一进程/句柄而造成授权与状态竞争。

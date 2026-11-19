@@ -2,6 +2,19 @@
 
 All notable changes to GhostShredder are documented here.
 
+## [0.3.0-alpha3] - 2026-11-19
+
+- Replaced the single-target UI with an ordered multi-file / multi-folder target queue.
+- Added multi-select file picking, manual path add, deduplication, remove-selected and clear-list controls.
+- Added elevated Explorer drag-and-drop compatibility using `WM_DROPFILES`, `WM_COPYGLOBALDATA`, `DragAcceptFiles` and `ChangeWindowMessageFilterEx`.
+- Batch operations execute targets sequentially; no parallel handle closing or deletion.
+- Batch cancellation now stops the active item and leaves later targets unexecuted.
+- Fixed redirected `cmd.exe` delete error text by using Unicode output.
+- Added Windows Restart Manager as a fast candidate-PID discovery layer for **file** targets.
+- B/File Handle scanning now prefers Restart Manager candidates and performs precise Handle resolution only inside those processes, avoiding many global-handle scan stalls.
+- Retains global Handle scanning as fallback when Restart Manager does not produce candidates.
+- Verified on real Windows 11 with both CWD-held directory locks and ordinary file Handle sharing violations.
+
 ## [0.2.5] - 2026-11-15
 
 - Added single-task state machine (`Idle -> Running -> Cancelling -> Idle`).
